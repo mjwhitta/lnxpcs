@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# A script to make wallpapers from given images (or at least attempt).
+# by Miles Whittaker <mjwhitta@gmail.com>
+#
+# --------------------------------------------------------------------
+# The MIT License (MIT)
+#
+# Copyright (c) 2018 Miles Whittaker
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# --------------------------------------------------------------------
+
+### Helpers begin
+check_deps() {
+    local missing
+    for d in "${deps[@]}"; do
+        if [[ -z $(command -v "$d") ]]; then
+            # Force absolute path
+            if [[ ! -e "/$d" ]]; then
+                err "$d was not found"
+                missing="true"
+            fi
+        fi
+    done; unset d
+    [[ -z $missing ]] || exit 128
+}
+err() { echo -e "${color:+\e[31m}[!] $*${color:+\e[0m}" >&2; }
+errx() { err "${*:2}"; clean "$1"; }
+good() { echo -e "${color:+\e[32m}[+] $*${color:+\e[0m}"; }
+info() { echo -e "${color:+\e[37m}[*] $*${color:+\e[0m}"; }
+long_opt() {
+    local arg shift="0"
+    case "$1" in
+        "--"*"="*) arg="${1#*=}"; [[ -n $arg ]] || return 127 ;;
+        *) shift="1"; shift; [[ $# -gt 0 ]] || return 127; arg="$1" ;;
+    esac
+    echo "$arg"
+    return $shift
+}
+subinfo() { echo -e "${color:+\e[36m}[=] $*${color:+\e[0m}"; }
+warn() { echo -e "${color:+\e[33m}[-] $*${color:+\e[0m}"; }
+### Helpers end
+
+### Parallel helpers begin
+set -o noglob
+trap "clean 126" SIGINT # Ensure cleanup on ^C
+check_lock() {
+    [[ -n $cache ]] || errx 125 "Cache is not defined"
+    mkdir -p "$cache"
+    if [[ -f "$cache.lock" ]]; then
+        errx 125 "$cache.lock already exists"
+    fi
+    echo "$$" >"$cache.lock"
+}
+check_resume_file() {
+    if [[ -f "$json" ]] && [[ -z $resume ]]; then
+        warn "Resume file found" >&2
+        while :; do
+            # Prompt whether to overwrite or resume
+            local a
+            read -n 1 -p "Would you like to resume [y/n/q/c]: " -rs a
+            echo
+
+            case "$a" in
+                "c") clean 0 ;;
+                "n") write_resume_file; break ;;
+                "q") exit 0 ;;
+                "y") read_resume_file; resume="--resume"; break ;;
+                *) echo "Invalid response, try again!" ;;
+            esac
+        done
+    elif [[ -f "$json" ]]; then
+        read_resume_file
+    elif [[ -n $resume ]]; then
+        errx 124 "No resume file found"
+    else
+        write_resume_file
+    fi
+}
+clean() {
+    if [[ ${1:-0} -eq 0 ]] || [[ ${1:-0} -eq 122 ]]; then
+        [[ -z $cache ]] || [[ ! -d "$cache" ]] || rm -rf "$cache"
+    fi
+    [[ -z $script ]] || [[ ! -f "$script" ]] || rm -f "$script"
+    [[ ${1:-0} -eq 125 ]] || [[ -z $cache ]] || rm -f "$cache.lock"
+    show_cursor
+    exit "${1:-0}"
+}
+hide_cursor() { echo -en "\e[?25l"; }
+json_get() {
+    if [[ -z $json ]] || [[ ! -f "$json" ]]; then
+        return
+    fi
+    jq -cr ".$*" "$json" | sed -r "s/^null$//g"
+}
+show_cursor() { echo -en "\e[?25h"; }
+### Parallel helpers end
+
+read_resume_file() {
+    action="$(json_get "action")"
+    output="$(json_get "output")"
+    resolution="$(json_get "resolution")"
+}
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} [OPTIONS] <image1>... [imageN]
+
+DESCRIPTION
+    Create wallpapers from images.
+
+OPTIONS
+    -h, --help           Display this help message
+    -i, --info           Display background color that would be used
+        --no-color       Disable colorized output
+    -o, --output=DIR     Save to the specified directory (default: .)
+    -r, --resume         Resume from a previous run
+    -s, --size=WxH       Use the specified resolution (default:
+                         1920x1080)
+    -t, --threads=NUM    Use specified number of threads (default: 32)
+    -v, --verbose        Do not hide parallel errors
+
+EOF
+    exit "$1"
+}
+
+write_resume_file() {
+    [[ -n $cache ]] || return
+    [[ -n $json ]] || return
+    rm -rf "$cache"
+    mkdir -p "$cache"
+
+    cat >"$json" <<EOF
+{
+  "action": "$action",
+  "output": "$output",
+  "resolution": "$resolution"
+}
+EOF
+}
+
+declare -a args
+unset help resume verbose
+action="convert"
+color="true"
+output="."
+parallel="true"
+resolution="1920x1080"
+threads="32"
+
+# Parse command line options
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        "--") shift; args+=("$@"); break ;;
+        "-h"|"--help") help="true" ;;
+        "-i"|"--info") action="info" ;;
+        "--no-color") unset color ;;
+        "-o"|"--output"*) output="$(long_opt "$@")" ;;
+        "-r"|"--resume") resume="--resume" ;;
+        "-s"|"--size"*) resolution="$(long_opt "$@")" ;;
+        "-t"|"--threads"*) threads="$(long_opt "$@")" ;;
+        "-v"|"--verbose") verbose="true" ;;
+        *) args+=("$1") ;;
+    esac
+    case "$?" in
+        0) ;;
+        1) shift ;;
+        *) usage $? ;;
+    esac
+    shift
+done
+[[ ${#args[@]} -eq 0 ]] || set -- "${args[@]}"
+
+# Help info
+[[ -z $help ]] || usage 0
+
+# Check for missing dependencies
+declare -a deps
+deps+=("awk")
+deps+=("jq")
+deps+=("convert")
+deps+=("sha256sum")
+check_deps
+
+# Check for valid params
+[[ $# -gt 0 ]] || [[ -n $resume ]] || usage 1
+
+# Determine parallel situation
+if [[ -n $parallel ]] && [[ -z $(command -v parallel) ]]; then
+    warn "Parallel is not installed, defaulting to single-threaded"
+    unset parallel
+fi
+
+# Cite if needed
+if [[ -n $parallel ]] && [[ ! -f "$HOME/.parallel/will-cite" ]]; then
+    pvers="$(parallel --version | grep -ioPs "parallel \K\d+")"
+    if [[ $pvers -gt 20161222 ]] && [[ $pvers -lt 20181122 ]]; then
+        mkdir -p "$HOME/.parallel"
+        parallel --citation
+    fi
+    unset pvers
+fi
+
+# Cache variables
+hash="$(echo "$*" | sha256sum | awk '{print $1}')"
+cache="$HOME/.cache/${0##*/}/$hash"
+joblog="$cache/joblog.txt"
+json="$cache/${0##*/}.json"
+
+# Lock to prevent parallel issues
+check_lock
+
+# Check for resume file
+[[ -z $parallel ]] || check_resume_file
+hide_cursor
+
+[[ -z $resume ]] || info "Resuming..."
+
+info "Processing dataset for jobs"
+
+dataset="$cache/${0##*/}.dataset"
+if [[ ! -f "$dataset" ]]; then
+    touch "$dataset"
+
+    for data in "$@"; do
+        echo "$data" >>"$dataset"
+    done; unset data
+fi
+total="$(wc -l "$dataset" | awk '{print $1}')"
+[[ $total -gt 0 ]] || errx 122 "No dataset provided"
+
+subinfo "$total jobs to run"
+
+# Create sub-script
+script="/tmp/${0##*/}.parallel"
+cat >"$script" <<EOF
+#!/usr/bin/env bash
+
+### Helpers begin
+set -o noglob
+err() { echo -e "\r${color:+\e[31m}[!] \$*${color:+\e[0m}\e[K" >&2; }
+errx() { err "\${*:2}"; exit "\$1"; }
+good() { echo -e "\r${color:+\e[32m}[+] \$*${color:+\e[0m}\e[K"; }
+info() { echo -e "\r${color:+\e[37m}[*] \$*${color:+\e[0m}\e[K"; }
+msg() { echo -e "\r\$*\e[K"; }
+subinfo() { echo -e "\r${color:+\e[36m}[=] \$*${color:+\e[0m}\e[K"; }
+warn() { echo -e "\r${color:+\e[33m}[-] \$*${color:+\e[0m}\e[K"; }
+### Helpers end
+
+[[ -f "\$1" ]] || exit 1
+
+case "$action" in
+    "convert")
+        name="\$(
+            basename "\$1" | sed -r -e "s/\..+//g" \
+            -e "s/[^A-Za-z0-9]+/_/g"
+        )_$resolution.png"
+        if [[ -f "$output/\$name" ]]; then
+            warn "$output/\$name already exists"
+            exit 3
+        fi
+        ;;
+esac
+
+tleft="\$(convert "\$1" txt:- | grep -m 1 -oPs "#[A-Fa-f0-9]{6}")"
+
+bgcolor1="\$(
+    convert "\$1" -depth 8 +dither -format %c histogram:info: | \
+    sort -n | tail -n 1 | grep -oPs "#[A-Fa-f0-9]{6}"
+)"
+
+bgcolor2="\$(
+    convert "\$1" -depth 8 +dither -format %c histogram:info: | \
+    sort -n | tail -n 2 | grep -m 1 -oPs "#[A-Fa-f0-9]{6}"
+)"
+
+case "\$tleft" in
+    "\$bgcolor1"|"\$bgcolor2") bgcolor="\$tleft" ;;
+    *) bgcolor="\$bgcolor1" ;;
+esac
+
+case "$action" in
+    "convert")
+        if [[ -n \$bgcolor ]]; then
+            good "Creating $output/\$name"
+            convert "\$1" -background "\$bgcolor" -gravity center \
+                -resize "$resolution" -extent "$resolution" \
+                "$output/\$name"
+        else
+            errx 4 "Couldn't create $output/\$name"
+        fi
+        ;;
+    "info")
+        if [[ -n \$bgcolor ]]; then
+            subinfo "\$bgcolor"
+        else
+            errx 5 "No bgcolor found"
+        fi
+        ;;
+esac
+EOF
+chmod 700 "$script"
+
+# Run sub-script
+mkdir -p "$output"
+if [[ -n $parallel ]]; then
+    parallel -a "$dataset" --bar --joblog ${resume:++}"$joblog" --lb \
+        -P "$threads" -r $resume "$script" {}
+    [[ -n $verbose ]] || echo -en "\e[1A\e[K" >&2
+else
+    count="1"
+    while read -r data; do
+        echo -e "\r\e[K" >&2
+        echo -en "${color:+\e[37m}[$count/$total]\e[0m\e[K\e[1A" >&2
+        $script "$data"
+        ((count += 1))
+    done <"$dataset"; unset data
+fi
+
+clean
